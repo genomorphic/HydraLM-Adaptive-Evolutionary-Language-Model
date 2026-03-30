@@ -609,12 +609,26 @@ class Homeostasis(nn.Module):
     """
     Four-scalar internal state used to generate intrinsic training rewards.
 
+    Dual-horizon baseline
+    ---------------------
+    Two EMAs of CLM loss serve different purposes:
+
+    fast_ema  (alpha=0.20, ~5-step horizon)
+        Short-term signal. Pain, energy, and excitement are computed against
+        this. Reacts within a handful of steps so acute distress (optimizer
+        rebuild, loss spike, new cell wiring) fires pain immediately.
+
+    clm_loss_ema  (alpha=0.05, ~20-step horizon)
+        Long-term structural trend. Integrity is computed against this.
+        Drives depth pressure, curriculum weighting, and EA decisions.
+        Insensitive to single-step noise.
+
     Variables
     ---------
     energy     [0,1] : running capacity (drains each step, recovers on low loss).
-    integrity  [0,1] : structural health (damaged by high loss, recovers slowly).
+    integrity  [0,1] : structural health trend — slow, stable signal.
     excitement [0,1] : novelty signal (spikes on large loss changes).
-    pain       [0,1] : acute distress (0=healthy, 1=maximum distress).
+    pain       [0,1] : acute distress against fast_ema — fires within steps.
 
     Intrinsic rewards (computed in HydraLM.pretrain_step)
     -----------------------------------------------------
@@ -624,6 +638,8 @@ class Homeostasis(nn.Module):
                                      diverse predictions when excited.
     consolidation_clip (pain)      : reduce gradient from the hardest tokens
                                      when pain is high — avoid destabilisation.
+    reinforce_gate (pain+energy)   : scale reinforce_weight down when distressed —
+                                     don't aggressively update exit gate mid-crisis.
     depth_pressure (integrity)     : scale UncertaintyGate thresholds lower when
                                      integrity is low — force deeper processing.
     """
@@ -653,10 +669,10 @@ class Homeostasis(nn.Module):
         # Pain lives in [0, 1]: 0 = no distress, 1 = maximum distress.
         # Positive to match the convention of the other three homeostasis scalars.
         self.register_buffer("pain",       torch.tensor(0.0))
-        # clm_loss_ema tracks the CLM (next-token) loss only — the clean
-        # language learning signal decoupled from regularisation terms.
-        # All four homeostasis variables are computed against this, not
-        # the composite training loss which includes MLM, entropy, tax etc.
+        # Dual-horizon baselines:
+        # fast_ema    — alpha=0.20, ~5-step horizon. Used by pain/energy/excitement.
+        # clm_loss_ema — alpha=0.05, ~20-step horizon. Used by integrity only.
+        self.register_buffer("fast_ema",      torch.tensor(100.0))
         self.register_buffer("clm_loss_ema",  torch.tensor(100.0))
         self.register_buffer("homeo_step",    torch.tensor(0))
 
@@ -676,45 +692,50 @@ class Homeostasis(nn.Module):
         """
         Update homeostasis state from the CLM (next-token) loss only.
 
-        Decoupled from total training loss deliberately — the composite
-        loss includes MLM, regularisation, compute tax etc. which are
-        optimisation signals, not language learning signals. Homeostasis
-        should respond to whether the model is getting better at predicting
-        text, not whether auxiliary objectives are being satisfied.
+        Dual-horizon baselines:
+          fast_ema    (alpha=0.20) — short-term, ~5 steps. Pain/energy/excitement.
+          clm_loss_ema (alpha=0.05) — long-term, ~20 steps. Integrity only.
 
-        clm_loss      : current step CLM cross-entropy loss (language signal)
-        prev_clm_loss : previous step CLM loss (for regression detection)
+        This means pain fires within a few steps of a loss spike (optimizer
+        rebuild, new cell wiring, corpus difficulty jump) while integrity
+        reflects the genuine multi-hundred-step learning trend.
         """
         with torch.no_grad():
             self.homeo_step += 1
-            step = self.homeo_step.item()
+            step      = self.homeo_step.item()
             in_warmup = step <= self.warmup_steps
 
-            # Update CLM EMA — converges faster during warmup
-            alpha = 0.20 if in_warmup else 0.05
-            self.clm_loss_ema = (1 - alpha) * self.clm_loss_ema + alpha * clm_loss
-            baseline = self.clm_loss_ema.item() + 1e-8
-            ratio    = clm_loss / baseline
+            # ── Fast EMA — short-horizon baseline for pain/energy/excitement ──
+            # Alpha=0.20 always — even post-warmup we want fast reaction.
+            self.fast_ema = (1 - 0.20) * self.fast_ema + 0.20 * clm_loss
+            fast_baseline = self.fast_ema.item() + 1e-8
+            fast_ratio    = clm_loss / fast_baseline
 
-            # Pain — suppressed during warmup
+            # ── Slow EMA — long-horizon baseline for integrity ──────────────
+            slow_alpha = 0.20 if in_warmup else 0.05
+            self.clm_loss_ema = (1 - slow_alpha) * self.clm_loss_ema + slow_alpha * clm_loss
+            slow_baseline = self.clm_loss_ema.item() + 1e-8
+            slow_ratio    = clm_loss / slow_baseline
+
+            # ── Pain (against fast baseline) ────────────────────────────────
             if in_warmup:
                 self.pain = torch.tensor(max(0.0, self.pain.item() * (1.0 - self.pain_decay)))
             else:
                 regression      = clm_loss - prev_clm_loss
                 regression_pain = max(0.0, regression / (abs(prev_clm_loss) + 1e-8))
 
-                if ratio > 1.0 + self.pain_threshold:
-                    # Severe: CLM loss well above its own baseline
-                    acute = min(1.0, ratio - 1.0 - self.pain_threshold)
+                if fast_ratio > 1.0 + self.pain_threshold:
+                    # Severe: loss well above fast baseline — fires within ~3 steps
+                    acute = min(1.0, fast_ratio - 1.0 - self.pain_threshold)
                     self.pain = torch.tensor(min(1.0, self.pain.item() + acute * 0.5))
-                elif regression > 0.05 and regression_pain > 0.005 and ratio > 1.0:
-                    # Mild: CLM loss increased vs previous step AND above baseline
+                elif regression > 0.05 and regression_pain > 0.005 and fast_ratio > 1.0:
+                    # Mild: loss increased vs previous step AND above fast baseline
                     mild = min(0.3, regression_pain * 2.0)
                     self.pain = torch.tensor(min(1.0, self.pain.item() + mild * 0.3))
                 else:
                     self.pain = torch.tensor(max(0.0, self.pain.item() * (1.0 - self.pain_decay)))
 
-            # Excitement — spikes on large CLM loss changes (novelty in language signal)
+            # ── Excitement (against fast baseline delta) ────────────────────
             delta = abs(clm_loss - prev_clm_loss)
             if delta > self.excitement_trigger:
                 spike = min(1.0, delta / (self.excitement_trigger + 1e-8) * 0.2)
@@ -724,18 +745,18 @@ class Homeostasis(nn.Module):
                     max(0.0, self.excitement.item() * (1.0 - self.excitement_decay))
                 )
 
-            # Energy — drains when CLM loss is above its own baseline
+            # ── Energy (against fast baseline) ──────────────────────────────
             drain    = self.energy_decay * (1.0 + self.pain.item())
-            recovery = self.energy_recovery if clm_loss < baseline else 0.0
+            recovery = self.energy_recovery if clm_loss < fast_baseline else 0.0
             self.energy = torch.tensor(
                 max(0.0, min(1.0, self.energy.item() - drain + recovery))
             )
 
-            # Integrity — tracks CLM improvement trend, suppressed during warmup
+            # ── Integrity (against slow baseline — structural trend only) ───
             if not in_warmup:
-                if ratio < 0.98:
+                if slow_ratio < 0.98:
                     self.integrity = torch.tensor(min(1.0, self.integrity.item() + 0.005))
-                elif ratio > 1.30:
+                elif slow_ratio > 1.30:
                     self.integrity = torch.tensor(max(0.0, self.integrity.item() - 0.003))
                 elif (clm_loss - prev_clm_loss) > 0.05:
                     self.integrity = torch.tensor(max(0.0, self.integrity.item() - 0.001))
@@ -749,6 +770,13 @@ class Homeostasis(nn.Module):
         ex  = self.excitement.item()
         p   = self.pain.item()      # in [0, 1]
         ing = self.integrity.item()
+
+        # reinforce_gate: scale down exit gate policy gradient when distressed.
+        # High pain OR low energy → model is in crisis, don't aggressively
+        # update the exit gate architecture decision on top of that.
+        # Gate is multiplicative: 1.0 = full reinforce_weight, 0.0 = disabled.
+        # Uses the more severe of pain and energy-deficit signals.
+        reinforce_gate = max(0.0, 1.0 - max(p, 1.0 - e))
 
         return {
             # curiosity: low energy → push harder, upweight high-perplexity tokens
@@ -767,6 +795,10 @@ class Homeostasis(nn.Module):
             # range [0.0, 1.0]
             "depth_pressure": ing,
 
+            # reinforce_gate: multiplier on reinforce_weight [0.0, 1.0]
+            # 1.0 = healthy, apply full PG; 0.0 = distressed, suppress PG
+            "reinforce_gate": reinforce_gate,
+
             # raw pain for logging
             "pain_raw": p,
         }
@@ -776,7 +808,9 @@ class Homeostasis(nn.Module):
             f"energy={self.energy.item():.3f} "
             f"integrity={self.integrity.item():.3f} "
             f"excitement={self.excitement.item():.3f} "
-            f"pain={self.pain.item():.3f}"   # 0=healthy, 1=max distress
+            f"pain={self.pain.item():.3f} "
+            f"fast_ema={self.fast_ema.item():.4f} "
+            f"slow_ema={self.clm_loss_ema.item():.4f}"
         )
 
 
@@ -2424,7 +2458,8 @@ class HydraLM(nn.Module):
                 advantages     = pg_rewards_t.unsqueeze(1).expand_as(log_probs_t)
                 reinforce_loss = -(log_probs_t * advantages).mean()
                 if not (torch.isnan(reinforce_loss) or torch.isinf(reinforce_loss)):
-                    pg_loss = reinforce_loss * self.reinforce_weight
+                    reinforce_gate = rewards.get("reinforce_gate", 1.0)
+                    pg_loss = reinforce_loss * self.reinforce_weight * reinforce_gate
                     pg_loss.backward()
                     torch.nn.utils.clip_grad_norm_(
                         self.exit_gate.parameters(), max_norm=0.5
@@ -2448,11 +2483,12 @@ class HydraLM(nn.Module):
         self._prev_clm_loss.fill_(clm_loss_val)
 
         # ---- Evolution -------------------------------------------------
-        _, sv_info = self._evolve(loss_val, fused_c.detach(), cell_targets)
+        arch_changed, sv_info = self._evolve(loss_val, fused_c.detach(), cell_targets)
 
         reward_info = {
-            **rewards,
+            **rewards,          # includes reinforce_gate for logging
             **sv_info,          # sv_cell_0 … sv_cell_N for StatsTracker
+            "arch_changed":     arch_changed,   # signals train.py to rebuild optimizer
             "mlm_loss":         mlm_loss.item(),
             "clm_loss":         clm_loss.item(),
             "cell_loss":        cell_loss.item(),
