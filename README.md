@@ -102,7 +102,7 @@ python inspect_checkpoint.py runs/run1/ckpt_step00010000.json
 
 ## Checkpoint Format
 
-Each checkpoint saves five files:
+Each checkpoint saves four files:
 
 ```
 ckpt_step00010000.json       # Human-readable topology, config, EA state
