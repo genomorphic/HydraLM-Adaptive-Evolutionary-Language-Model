@@ -705,12 +705,28 @@ def train(cfg: TrainConfig) -> None:
         )
         if resumed_model is not None:
             model = resumed_model
-            # Rebuild optimizer against the resumed model's actual parameters
+            # Rebuild main optimizer against the resumed model's actual parameters,
+            # preserving the exit-gate exclusion used during initial construction.
+            exit_gate_params = set(id(p) for p in model.exit_gate.parameters())
+            if cfg.reinforce_weight > 0:
+                main_params = [p for p in model.parameters()
+                               if p.requires_grad and id(p) not in exit_gate_params]
+            else:
+                main_params = [p for p in model.parameters() if p.requires_grad]
             optimizer = torch.optim.AdamW(
-                [p for p in model.parameters() if p.requires_grad],
-                lr=cfg.lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.95),
+                main_params, lr=cfg.lr,
+                weight_decay=cfg.weight_decay, betas=(0.9, 0.95),
             )
+            # Also rebuild pg_optimizer so it points at the resumed model's
+            # exit gate — the old one referenced the discarded scratch model.
+            pg_optimizer = torch.optim.Adam(
+                model.exit_gate.parameters(), lr=cfg.lr * 0.1,
+            ) if cfg.reinforce_weight > 0 else None
             print(f"  Resumed at step {start_step:,} | best_ppl={best_ppl:.2f}")
+        else:
+            print("  WARNING: --resume was set but no checkpoint was found in "
+                  f"{run_dir}. Check that ckpt_latest.txt exists. "
+                  "Starting from scratch.")
 
     # ---- CSV log ----
     log_path = run_dir / "loss_log.csv"
@@ -765,18 +781,31 @@ def train(cfg: TrainConfig) -> None:
         )
         step_times.append(time.time() - t0)
 
-        # Rebuild optimizer if EA changed architecture
-        if step % model.growth_interval == 0:
+        # Rebuild optimizer only when EA actually changed the architecture.
+        # Rebuilding every growth_interval wipes Adam momentum unconditionally,
+        # causing loss spikes after every EA step even when nothing changed.
+        # reward_info["arch_changed"] is set by pretrain_step when _evolve
+        # returns changed=True.
+        if reward_info.get("arch_changed", False):
             exit_gate_params = set(id(p) for p in model.exit_gate.parameters())
             if pg_optimizer is not None:
                 new_main = [p for p in model.parameters()
                             if p.requires_grad and id(p) not in exit_gate_params]
             else:
                 new_main = [p for p in model.parameters() if p.requires_grad]
+            # Transplant existing Adam state for parameters that survived the
+            # architecture change — preserves momentum for unchanged params.
+            old_state = {p.data_ptr(): optimizer.state.get(p, {})
+                         for group in optimizer.param_groups
+                         for p in group["params"]}
             optimizer = torch.optim.AdamW(
                 new_main, lr=lr_now,
                 weight_decay=cfg.weight_decay, betas=(0.9, 0.95)
             )
+            for p in new_main:
+                s = old_state.get(p.data_ptr(), {})
+                if s:
+                    optimizer.state[p] = s
             if pg_optimizer is not None:
                 pg_optimizer = torch.optim.Adam(
                     model.exit_gate.parameters(), lr=cfg.lr * 0.1
